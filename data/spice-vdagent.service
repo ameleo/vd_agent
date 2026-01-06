@@ -8,6 +8,7 @@ ConditionPathExists=/run/spice-vdagentd/spice-vdagent-sock
 
 # Ensure display server is already running
 PartOf=graphical-session.target
+After=graphical-session.target
 
 [Service]
 ExecStart=/usr/bin/spice-vdagent -x

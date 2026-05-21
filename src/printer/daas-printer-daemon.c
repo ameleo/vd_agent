@@ -41,12 +41,15 @@
 
 /* ── Constantes ──────────────────────────────────────────────────────────── */
 
-#define VIRTIO_PORT   "/dev/virtio-ports/org.daas.printer.0"
-#define CACHE_FILE    "/run/daas-printers.cache"
-#define IPP_PORT      8631          /* TCP localhost, écouté par le daemon  */
-#define FRAME_HDR     13            /* sizeof(daas_print_frame) = 4+4+1+4   */
-#define BUF_MAX       (4 * 1024 * 1024)
-#define TCP_BUF       (64 * 1024)
+#define VIRTIO_PORT     "/dev/virtio-ports/org.daas.printer.0"
+#define CACHE_FILE      "/run/daas-printers.cache"
+#define IPP_PORT        8631          /* TCP localhost, écouté par le daemon  */
+#define FRAME_HDR       13            /* sizeof(daas_print_frame) = 4+4+1+4   */
+#define BUF_MAX         (4 * 1024 * 1024)
+#define TCP_BUF         (64 * 1024)
+#define MAX_CUPS_CONNS  8             /* connexions CUPS simultanées max      */
+
+typedef struct { int fd; uint32_t conn_id; } cups_conn_t;
 
 /* ── Helpers ──────────────────────────────────────────────────────────────── */
 
@@ -215,29 +218,32 @@ static int create_ipp_listener(void)
 
 /* ── Boucle principale ───────────────────────────────────────────────────── */
 
-/*
- * Modèle simplifié : une seule connexion CUPS active à la fois.
- * conn_id = 1 pour toute connexion (pas de multiplexage nécessaire :
- * CUPS sérialise les jobs sur une file).
- */
 static void read_loop(int virtio_fd, int ipp_listen_fd)
 {
-    uint8_t *vbuf  = malloc(BUF_MAX);
-    uint8_t *tbuf  = malloc(TCP_BUF);
+    uint8_t *vbuf = malloc(BUF_MAX);
+    uint8_t *tbuf = malloc(TCP_BUF);
     if (!vbuf || !tbuf) { perror("malloc"); free(vbuf); free(tbuf); return; }
 
-    size_t vlen      = 0;     /* octets accumulés depuis virtio */
-    int    cups_fd   = -1;    /* connexion CUPS active           */
+    size_t vlen = 0;
+
+    /* Pool de connexions CUPS simultanées (PPD discovery + job + status) */
+    cups_conn_t conns[MAX_CUPS_CONNS];
+    for (int i = 0; i < MAX_CUPS_CONNS; i++) conns[i].fd = -1;
+    uint32_t next_id = 1;
 
     while (1) {
         fd_set rfds;
         FD_ZERO(&rfds);
-        FD_SET(virtio_fd,    &rfds);
+        FD_SET(virtio_fd,     &rfds);
         FD_SET(ipp_listen_fd, &rfds);
-        if (cups_fd >= 0) FD_SET(cups_fd, &rfds);
 
         int maxfd = virtio_fd > ipp_listen_fd ? virtio_fd : ipp_listen_fd;
-        if (cups_fd > maxfd) maxfd = cups_fd;
+        for (int i = 0; i < MAX_CUPS_CONNS; i++) {
+            if (conns[i].fd >= 0) {
+                FD_SET(conns[i].fd, &rfds);
+                if (conns[i].fd > maxfd) maxfd = conns[i].fd;
+            }
+        }
 
         if (select(maxfd + 1, &rfds, NULL, NULL, NULL) < 0) {
             if (errno == EINTR) continue;
@@ -245,32 +251,45 @@ static void read_loop(int virtio_fd, int ipp_listen_fd)
             break;
         }
 
-        /* Nouvelle connexion CUPS */
+        /* Nouvelle connexion CUPS → slot libre, conn_id unique */
         if (FD_ISSET(ipp_listen_fd, &rfds)) {
             int new_fd = accept(ipp_listen_fd, NULL, NULL);
             if (new_fd >= 0) {
-                if (cups_fd >= 0) close(cups_fd);
-                cups_fd = new_fd;
-                fprintf(stderr, "daas-printer: connexion CUPS (IPP)\n");
+                int slot = -1;
+                for (int i = 0; i < MAX_CUPS_CONNS; i++) {
+                    if (conns[i].fd < 0) { slot = i; break; }
+                }
+                if (slot >= 0) {
+                    conns[slot].fd      = new_fd;
+                    conns[slot].conn_id = next_id++;
+                    fprintf(stderr, "daas-printer: connexion CUPS conn_id=%u\n",
+                            conns[slot].conn_id);
+                } else {
+                    fprintf(stderr, "daas-printer: trop de connexions, refus\n");
+                    close(new_fd);
+                }
             }
         }
 
-        /* Données CUPS → encapsuler en frame TCP_DATA → virtio */
-        if (cups_fd >= 0 && FD_ISSET(cups_fd, &rfds)) {
-            ssize_t n = read(cups_fd, tbuf, TCP_BUF);
+        /* Données CUPS → frames DAAS_TCP_DATA → virtio */
+        for (int i = 0; i < MAX_CUPS_CONNS; i++) {
+            if (conns[i].fd < 0 || !FD_ISSET(conns[i].fd, &rfds)) continue;
+            ssize_t n = read(conns[i].fd, tbuf, TCP_BUF);
             if (n <= 0) {
-                fprintf(stderr, "daas-printer: CUPS fermé (n=%zd)\n", n);
-                send_frame(virtio_fd, DAAS_TCP_CLOSE, 1, NULL, 0);
-                close(cups_fd);
-                cups_fd = -1;
+                fprintf(stderr, "daas-printer: CUPS conn_id=%u fermée\n",
+                        conns[i].conn_id);
+                send_frame(virtio_fd, DAAS_TCP_CLOSE, conns[i].conn_id, NULL, 0);
+                close(conns[i].fd);
+                conns[i].fd = -1;
             } else {
-                if (send_frame(virtio_fd, DAAS_TCP_DATA, 1, tbuf, (uint32_t)n) < 0)
+                if (send_frame(virtio_fd, DAAS_TCP_DATA, conns[i].conn_id,
+                               tbuf, (uint32_t)n) < 0)
                     fprintf(stderr, "daas-printer: write virtio: %s\n",
                             strerror(errno));
             }
         }
 
-        /* Données virtio → parser frames */
+        /* Données virtio → parser frames → router par conn_id */
         if (FD_ISSET(virtio_fd, &rfds)) {
             ssize_t n = read(virtio_fd, vbuf + vlen, BUF_MAX - vlen);
             if (n <= 0) {
@@ -286,11 +305,12 @@ static void read_loop(int virtio_fd, int ipp_listen_fd)
                 memcpy(&magic, vbuf + off, 4);
                 if (le32toh(magic) != DAAS_PRINT_MAGIC) { off++; continue; }
 
+                uint32_t conn_id;
                 uint8_t  type;
                 uint32_t psize;
-                memcpy(&type,  vbuf + off + 8, 1);
-                memcpy(&psize, vbuf + off + 9, 4);
-                psize = le32toh(psize);
+                memcpy(&conn_id, vbuf + off + 4, 4); conn_id = le32toh(conn_id);
+                memcpy(&type,    vbuf + off + 8, 1);
+                memcpy(&psize,   vbuf + off + 9, 4); psize   = le32toh(psize);
 
                 if (off + FRAME_HDR + psize > vlen) break;
 
@@ -299,14 +319,21 @@ static void read_loop(int virtio_fd, int ipp_listen_fd)
                 if (type == DAAS_PRINT_PRINTER_LIST) {
                     handle_printer_list(virtio_fd, payload, psize);
                 } else if (type == DAAS_TCP_DATA) {
-                    /* Réponse IPP du client → renvoyer à CUPS */
-                    if (cups_fd >= 0)
-                        write_all(cups_fd, payload, psize);
+                    for (int i = 0; i < MAX_CUPS_CONNS; i++) {
+                        if (conns[i].fd >= 0 && conns[i].conn_id == conn_id) {
+                            write_all(conns[i].fd, payload, psize);
+                            break;
+                        }
+                    }
                 } else if (type == DAAS_TCP_CLOSE) {
-                    if (cups_fd >= 0) {
-                        close(cups_fd);
-                        cups_fd = -1;
-                        fprintf(stderr, "daas-printer: TCP_CLOSE reçu du client\n");
+                    for (int i = 0; i < MAX_CUPS_CONNS; i++) {
+                        if (conns[i].fd >= 0 && conns[i].conn_id == conn_id) {
+                            close(conns[i].fd);
+                            conns[i].fd = -1;
+                            fprintf(stderr, "daas-printer: TCP_CLOSE conn_id=%u\n",
+                                    conn_id);
+                            break;
+                        }
                     }
                 }
 
@@ -319,7 +346,8 @@ static void read_loop(int virtio_fd, int ipp_listen_fd)
         }
     }
 
-    if (cups_fd >= 0) close(cups_fd);
+    for (int i = 0; i < MAX_CUPS_CONNS; i++)
+        if (conns[i].fd >= 0) close(conns[i].fd);
     free(vbuf);
     free(tbuf);
 }

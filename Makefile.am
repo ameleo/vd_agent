@@ -215,7 +215,7 @@ check_PROGRAMS += tests/test-termination
 # The binary must be installed as "spice" (matching the URI scheme "spice://"),
 # root-owned, mode 0700, in the CUPS backend directory.
 if HAVE_CUPS
-noinst_PROGRAMS += spice-cups-backend
+noinst_PROGRAMS = spice-cups-backend
 
 spice_cups_backend_SOURCES = \
 	src/printer/spice-cups-backend.c \

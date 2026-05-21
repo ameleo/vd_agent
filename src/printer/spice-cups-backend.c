@@ -33,6 +33,7 @@
 /* ── Constants ───────────────────────────────────────────────────────────── */
 
 #define VIRTIO_PORT  "/dev/virtio-ports/org.daas.printer.0"
+#define CACHE_FILE   "/run/daas-printers.cache"
 #define CHUNK_SIZE   (64u * 1024u)
 
 /*
@@ -173,6 +174,19 @@ static void handle_sigterm(int sig)
     _exit(CUPS_BACKEND_CANCEL);
 }
 
+/* ── Helpers pour DEVICE_URI et cache ───────────────────────────────────── */
+
+/* Retourne la partie après "spice:///" dans DEVICE_URI, ou NULL. */
+static const char *printer_name_from_env(void)
+{
+    const char *uri = getenv("DEVICE_URI");
+    if (!uri) return NULL;
+    const char *p = strstr(uri, "spice:///");
+    if (!p) return NULL;
+    p += 9; /* strlen("spice:///") */
+    return *p ? p : NULL;
+}
+
 /* ── Entry point ──────────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[])
@@ -181,9 +195,29 @@ int main(int argc, char *argv[])
      * Device discovery — CUPS calls the backend with no arguments to
      * enumerate available devices.  One device per line:
      *   class uri "make-and-model" "info" ["device-id"]
+     * We read the printer cache built by daas-printer-daemon; fall back to
+     * a generic entry if the cache is absent (daemon not yet running).
      */
     if (argc == 1) {
-        puts("direct spice:/// \"DaaS SPICE Printer\" \"DaaS SPICE virtual printer\"");
+        FILE *cache = fopen(CACHE_FILE, "r");
+        int   found = 0;
+        if (cache) {
+            char line[1024];
+            while (fgets(line, (int)sizeof(line), cache)) {
+                char cups_name[256], display[512];
+                int  is_default = 0;
+                /* format: cups_name\tdisplay_name\tis_default\n */
+                if (sscanf(line, "%255[^\t]\t%511[^\t]\t%d",
+                           cups_name, display, &is_default) >= 2) {
+                    printf("direct spice:///%s \"%s\" \"DaaS: %s\"\n",
+                           cups_name, display, display);
+                    found++;
+                }
+            }
+            fclose(cache);
+        }
+        if (!found)
+            puts("direct spice:/// \"DaaS SPICE Printer\" \"DaaS SPICE virtual printer\"");
         return CUPS_BACKEND_OK;
     }
 
@@ -230,13 +264,34 @@ int main(int argc, char *argv[])
     fprintf(stderr, "INFO: Sending job %u \"%s\" (user: %s) to SPICE client\n",
             current_job_id, title, user);
 
+    /*
+     * Append printer=<cups_name> to the options string so the client knows
+     * which physical printer to target.  CUPS sets DEVICE_URI=spice:///cups_name.
+     */
+    char *ext_options = NULL;
+    const char *pname = printer_name_from_env();
+    if (pname) {
+        size_t base_len = options ? strlen(options) : 0;
+        size_t plen     = strlen(pname);
+        ext_options = malloc(base_len + plen + 10);
+        if (ext_options) {
+            if (base_len)
+                snprintf(ext_options, base_len + plen + 10,
+                         "%s printer=%s", options, pname);
+            else
+                snprintf(ext_options, plen + 9, "printer=%s", pname);
+        }
+    }
+
     int ret = CUPS_BACKEND_OK;
 
-    if (send_job_start(title, user, options) < 0) {
+    if (send_job_start(title, user, ext_options ? ext_options : options) < 0) {
         fprintf(stderr, "ERROR: send JOB_START failed: %s\n", strerror(errno));
+        free(ext_options);
         ret = CUPS_BACKEND_FAILED;
         goto out;
     }
+    free(ext_options);
 
     if (forward_job_data(in_fd) < 0) {
         abort_job();

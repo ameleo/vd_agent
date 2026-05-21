@@ -26,6 +26,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <endian.h>
@@ -49,12 +50,28 @@
 #define CUPS_BACKEND_STOP          4   /* stop the queue – hardware missing */
 #define CUPS_BACKEND_CANCEL        5
 
+/* ── Helpers ──────────────────────────────────────────────────────────────── */
+
+/* Exécute une commande via fork/execvp (évite l'injection shell). */
+static int run(char *const argv[])
+{
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); close(devnull); }
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
 /* ── Module state ─────────────────────────────────────────────────────────── */
 
 static int      port_fd         = -1;
 static uint32_t current_job_id  = 0;
-
-/* ── Helpers ──────────────────────────────────────────────────────────────── */
 
 static int write_all(int fd, const void *buf, size_t len)
 {
@@ -107,11 +124,11 @@ static uint8_t detect_format(void)
 /*
  * Build and send the JOB_START frame.
  * title, user and options may be NULL (treated as empty).
+ * fmt : DAAS_PRINT_FMT_* (passé explicitement pour permettre la conversion PS→PDF).
  */
-static int send_job_start(const char *title, const char *user,
+static int send_job_start(uint8_t fmt, const char *title, const char *user,
                           const char *options)
 {
-    uint8_t  fmt         = detect_format();
     uint16_t title_len   = title   ? (uint16_t)strlen(title)   : 0;
     uint16_t user_len    = user    ? (uint16_t)strlen(user)    : 0;
     uint16_t options_len = options ? (uint16_t)strlen(options) : 0;
@@ -270,6 +287,52 @@ int main(int argc, char *argv[])
     }
 
     /*
+     * Détecte le format et convertit PostScript → PDF si nécessaire.
+     * Le client Windows ne peut pas rendre du PostScript nativement ;
+     * ps2pdf (GhostScript) fait la conversion sur le guest Linux.
+     */
+    uint8_t job_fmt     = detect_format();
+    char    tmp_ps[256] = "";
+    char    tmp_pdf[256] = "";
+
+    if (job_fmt == DAAS_PRINT_FMT_PS) {
+        const char *ps_src = filename;
+
+        if (!ps_src) {
+            /* Cas stdin : il faut bufferiser avant de passer à ps2pdf. */
+            snprintf(tmp_ps, sizeof(tmp_ps), "/tmp/daas-%d.ps", (int)getpid());
+            int ps_tmp = open(tmp_ps, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (ps_tmp >= 0) {
+                uint8_t cb[65536]; ssize_t n;
+                while ((n = read(STDIN_FILENO, cb, sizeof(cb))) > 0)
+                    write(ps_tmp, cb, n);
+                close(ps_tmp);
+                ps_src = tmp_ps;
+            }
+        }
+
+        if (ps_src) {
+            snprintf(tmp_pdf, sizeof(tmp_pdf), "/tmp/daas-%d.pdf", (int)getpid());
+            char *conv[] = { "ps2pdf", (char *)ps_src, tmp_pdf, NULL };
+            if (run(conv) == 0) {
+                int pdf_fd = open(tmp_pdf, O_RDONLY);
+                if (pdf_fd >= 0) {
+                    if (in_fd != STDIN_FILENO) close(in_fd);
+                    in_fd   = pdf_fd;
+                    job_fmt = DAAS_PRINT_FMT_PDF;
+                    fprintf(stderr, "INFO: PostScript converti en PDF via ps2pdf\n");
+                } else {
+                    unlink(tmp_pdf); tmp_pdf[0] = '\0';
+                }
+            } else {
+                fprintf(stderr, "WARN: ps2pdf a échoué, envoi du PostScript brut\n");
+                unlink(tmp_pdf); tmp_pdf[0] = '\0';
+            }
+            if (tmp_ps[0]) { unlink(tmp_ps); tmp_ps[0] = '\0'; }
+        }
+    }
+
+    /*
      * Se connecte au proxy Unix socket géré par daas-printer-daemon.
      * Le daemon garde le virtio port ouvert (le char device est exclusif) et
      * relaie nos frames JOB_* vers le port virtio.
@@ -308,7 +371,7 @@ int main(int argc, char *argv[])
 
     int ret = CUPS_BACKEND_OK;
 
-    if (send_job_start(title, user, ext_options ? ext_options : options) < 0) {
+    if (send_job_start(job_fmt, title, user, ext_options ? ext_options : options) < 0) {
         fprintf(stderr, "ERROR: send JOB_START failed: %s\n", strerror(errno));
         free(ext_options);
         ret = CUPS_BACKEND_FAILED;
@@ -334,5 +397,6 @@ out:
     close(port_fd);
     port_fd = -1;
     if (filename) close(in_fd);
+    if (tmp_pdf[0]) unlink(tmp_pdf);
     return ret;
 }

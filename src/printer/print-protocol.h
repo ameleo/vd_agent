@@ -41,6 +41,9 @@
 
 #include <stdint.h>
 
+/* Unix socket used by daas-printer-daemon to proxy jobs from the CUPS backend */
+#define DAAS_PRINTER_PROXY_SOCK  "/run/daas-printer-proxy.sock"
+
 #define DAAS_PRINT_MAGIC    0x44414153U   /* "DAAS" stored LE */
 #define DAAS_PRINT_VERSION  1
 

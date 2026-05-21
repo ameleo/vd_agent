@@ -2,12 +2,13 @@
  * daas-printer-daemon — lit le port virtio-serial org.daas.printer.0,
  * parse les frames PRINTER_LIST et maintient les files CUPS correspondantes.
  *
+ * Le daemon agit aussi comme proxy pour le backend CUPS spice : il écoute
+ * sur DAAS_PRINTER_PROXY_SOCK et relaie les frames JOB_* vers le port
+ * virtio, évitant ainsi le conflit d'ouverture exclusive du char device.
+ *
  * Compile: gcc -O2 -o daas-printer-daemon daas-printer-daemon.c
  * Install: sudo install -m 0755 daas-printer-daemon /usr/local/sbin/
  * Run:     sudo daas-printer-daemon   (ou via systemd)
- *
- * Le daemon tourne en boucle : si le port se ferme (VM reboot, session
- * WebRTC terminée), il attend et réessaie.
  */
 
 #include <stdio.h>
@@ -20,6 +21,9 @@
 #include <ctype.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <endian.h>
 
 #include "print-protocol.h"
@@ -32,6 +36,21 @@
 #define BUF_MAX      (4 * 1024 * 1024)   /* 4 Mo — limite anti-burst */
 
 /* ── Helpers ──────────────────────────────────────────────────────────────── */
+
+static int write_all(int fd, const void *buf, size_t len)
+{
+    const uint8_t *p = buf;
+    while (len) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        p   += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
 
 /* Convertit un nom d'imprimante en nom CUPS valide (alphanum + tirets). */
 static void sanitize(const char *src, char *dst, size_t maxlen)
@@ -50,7 +69,6 @@ static int run(char *const argv[])
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
-        /* Silence stdout/stderr du sous-processus */
         int devnull = open("/dev/null", O_WRONLY);
         if (devnull >= 0) { dup2(devnull, 1); dup2(devnull, 2); close(devnull); }
         execvp(argv[0], argv);
@@ -77,7 +95,6 @@ static void cups_register(const char *display_name, const char *safe_name,
     char desc[512];
     snprintf(desc, sizeof(desc), "DaaS: %s", display_name);
 
-    /* Crée ou met à jour la file CUPS */
     char *add_args[] = {
         "lpadmin", "-p", cups_name, "-v", uri, "-E",
         "-D", desc, NULL
@@ -103,7 +120,6 @@ static void handle_printer_list(const uint8_t *payload, uint32_t size)
     memcpy(&count, payload, 2);
     count = le16toh(count);
 
-    /* Fichier cache temporaire (échange atomique à la fin) */
     char tmp_path[256];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", CACHE_FILE);
     FILE *cache = fopen(tmp_path, "w");
@@ -140,7 +156,6 @@ static void handle_printer_list(const uint8_t *payload, uint32_t size)
 
         int is_default = (flags & DAAS_PRINTER_FLAG_DEFAULT) != 0;
 
-        /* Format cache : cups_name\tdisplay_name\tis_default */
         fprintf(cache, "DaaS_%s\t%s\t%d\n", safe, display, is_default);
 
         cups_register(display, safe, is_default);
@@ -150,56 +165,122 @@ static void handle_printer_list(const uint8_t *payload, uint32_t size)
     rename(tmp_path, CACHE_FILE);
 }
 
-/* ── Boucle de lecture du port virtio-serial ─────────────────────────────── */
+/* ── Proxy socket ────────────────────────────────────────────────────────── */
 
-static void read_loop(int fd)
+static int create_proxy_sock(void)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) { perror("daas-printer: socket"); return -1; }
+
+    unlink(DAAS_PRINTER_PROXY_SOCK);
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    strncpy(sa.sun_path, DAAS_PRINTER_PROXY_SOCK, sizeof(sa.sun_path) - 1);
+
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0 ||
+        listen(fd, 4) < 0) {
+        perror("daas-printer: bind/listen proxy");
+        close(fd);
+        return -1;
+    }
+    /* Writable par root (le backend CUPS s'exécute en root). */
+    chmod(DAAS_PRINTER_PROXY_SOCK, 0600);
+    return fd;
+}
+
+/* ── Boucle principale : virtio + proxy ─────────────────────────────────── */
+
+static void read_loop(int virtio_fd, int proxy_fd)
 {
     uint8_t *buf  = malloc(BUF_MAX);
     size_t   blen = 0;
+    int      client_fd = -1;
 
     if (!buf) { perror("malloc"); return; }
 
     while (1) {
-        /* Lire un chunk */
-        ssize_t n = read(fd, buf + blen, BUF_MAX - blen);
-        if (n <= 0) {
-            if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
-            fprintf(stderr, "daas-printer: port fermé (read=%zd)\n", n);
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(virtio_fd, &rfds);
+        FD_SET(proxy_fd,  &rfds);
+        if (client_fd >= 0) FD_SET(client_fd, &rfds);
+
+        int maxfd = virtio_fd > proxy_fd ? virtio_fd : proxy_fd;
+        if (client_fd > maxfd) maxfd = client_fd;
+
+        int r = select(maxfd + 1, &rfds, NULL, NULL, NULL);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            perror("daas-printer: select");
             break;
         }
-        blen += (size_t)n;
 
-        /* Consommer les frames complètes */
-        size_t off = 0;
-        while (off + FRAME_HDR <= blen) {
-            uint32_t magic;
-            memcpy(&magic, buf + off, 4);
-            if (le32toh(magic) != DAAS_PRINT_MAGIC) {
-                /* Resync : avancer d'un octet */
-                off++;
-                continue;
+        /* Nouvelle connexion d'un backend CUPS */
+        if (FD_ISSET(proxy_fd, &rfds)) {
+            int new_fd = accept(proxy_fd, NULL, NULL);
+            if (new_fd >= 0) {
+                if (client_fd >= 0) close(client_fd);
+                client_fd = new_fd;
+                fprintf(stderr, "daas-printer: backend CUPS connecté\n");
             }
-
-            uint8_t  type;
-            uint32_t payload_size;
-            memcpy(&type,         buf + off + 8, 1);
-            memcpy(&payload_size, buf + off + 9, 4);
-            payload_size = le32toh(payload_size);
-
-            if (off + FRAME_HDR + payload_size > blen) break; /* incomplet */
-
-            if (type == DAAS_PRINT_PRINTER_LIST)
-                handle_printer_list(buf + off + FRAME_HDR, payload_size);
-
-            off += FRAME_HDR + payload_size;
         }
 
-        /* Décaler les données non consommées */
-        if (off > 0 && off < blen)
-            memmove(buf, buf + off, blen - off);
-        blen -= off;
+        /* Données du backend → relayer vers le port virtio */
+        if (client_fd >= 0 && FD_ISSET(client_fd, &rfds)) {
+            uint8_t fwd[65536];
+            ssize_t n = read(client_fd, fwd, sizeof(fwd));
+            if (n <= 0) {
+                fprintf(stderr, "daas-printer: backend déconnecté\n");
+                close(client_fd);
+                client_fd = -1;
+            } else {
+                if (write_all(virtio_fd, fwd, (size_t)n) < 0)
+                    fprintf(stderr, "daas-printer: write virtio: %s\n",
+                            strerror(errno));
+            }
+        }
+
+        /* Données du port virtio → parse les frames */
+        if (FD_ISSET(virtio_fd, &rfds)) {
+            ssize_t n = read(virtio_fd, buf + blen, BUF_MAX - blen);
+            if (n <= 0) {
+                if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+                fprintf(stderr, "daas-printer: port fermé (read=%zd)\n", n);
+                break;
+            }
+            blen += (size_t)n;
+
+            size_t off = 0;
+            while (off + FRAME_HDR <= blen) {
+                uint32_t magic;
+                memcpy(&magic, buf + off, 4);
+                if (le32toh(magic) != DAAS_PRINT_MAGIC) {
+                    off++;
+                    continue;
+                }
+
+                uint8_t  type;
+                uint32_t payload_size;
+                memcpy(&type,         buf + off + 8, 1);
+                memcpy(&payload_size, buf + off + 9, 4);
+                payload_size = le32toh(payload_size);
+
+                if (off + FRAME_HDR + payload_size > blen) break;
+
+                if (type == DAAS_PRINT_PRINTER_LIST)
+                    handle_printer_list(buf + off + FRAME_HDR, payload_size);
+
+                off += FRAME_HDR + payload_size;
+            }
+
+            if (off > 0 && off < blen)
+                memmove(buf, buf + off, blen - off);
+            blen -= off;
+        }
     }
 
+    if (client_fd >= 0) close(client_fd);
     free(buf);
 }
 
@@ -208,6 +289,14 @@ static void read_loop(int fd)
 int main(void)
 {
     fprintf(stderr, "daas-printer-daemon: démarré, attente de %s\n", VIRTIO_PORT);
+
+    int proxy_fd = create_proxy_sock();
+    if (proxy_fd < 0) {
+        fprintf(stderr, "daas-printer: impossible de créer le proxy socket\n");
+        return 1;
+    }
+    fprintf(stderr, "daas-printer: proxy socket prêt sur %s\n",
+            DAAS_PRINTER_PROXY_SOCK);
 
     while (1) {
         int fd = open(VIRTIO_PORT, O_RDWR);
@@ -219,12 +308,13 @@ int main(void)
         }
 
         fprintf(stderr, "daas-printer: port ouvert\n");
-        read_loop(fd);
+        read_loop(fd, proxy_fd);
         close(fd);
 
-        /* Courte pause avant de rouvrir (évite busy-loop si erreur permanente) */
         sleep(2);
     }
 
+    close(proxy_fd);
+    unlink(DAAS_PRINTER_PROXY_SOCK);
     return 0;
 }

@@ -26,6 +26,8 @@
 #include <errno.h>
 #include <signal.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <endian.h>
 
 #include "print-protocol.h"
@@ -174,6 +176,25 @@ static void handle_sigterm(int sig)
     _exit(CUPS_BACKEND_CANCEL);
 }
 
+/* ── Connexion au proxy du daemon ────────────────────────────────────────── */
+
+static int open_proxy_socket(void)
+{
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    strncpy(sa.sun_path, DAAS_PRINTER_PROXY_SOCK, sizeof(sa.sun_path) - 1);
+
+    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 /* ── Helpers pour DEVICE_URI et cache ───────────────────────────────────── */
 
 /* Retourne la partie après "spice:///" dans DEVICE_URI, ou NULL. */
@@ -248,16 +269,18 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* Open virtio port (write-only; the client sends JOB_STATUS asynchronously
-     * but we do not block waiting for it in this initial implementation). */
-    port_fd = open(VIRTIO_PORT, O_WRONLY);
+    /*
+     * Se connecte au proxy Unix socket géré par daas-printer-daemon.
+     * Le daemon garde le virtio port ouvert (le char device est exclusif) et
+     * relaie nos frames JOB_* vers le port virtio.
+     */
+    port_fd = open_proxy_socket();
     if (port_fd < 0) {
-        fprintf(stderr, "ERROR: cannot open %s: %s\n",
-                VIRTIO_PORT, strerror(errno));
-        fprintf(stderr, "INFO: Is the VM started with "
-                "-device virtserialport,name=org.daas.printer.0 ?\n");
+        fprintf(stderr, "ERROR: cannot connect to proxy %s: %s\n",
+                DAAS_PRINTER_PROXY_SOCK, strerror(errno));
+        fprintf(stderr, "INFO: Is daas-printer-daemon running ?\n");
         if (filename) close(in_fd);
-        /* STOP → CUPS holds the queue until the device comes back */
+        /* STOP → CUPS remet la file en attente jusqu'au retour du daemon */
         return CUPS_BACKEND_STOP;
     }
 

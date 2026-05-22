@@ -43,7 +43,6 @@
 /* ── Constantes ──────────────────────────────────────────────────────────── */
 
 #define VIRTIO_PORT     "/dev/virtio-ports/org.daas.printer.0"
-#define CACHE_FILE      "/run/daas-printers.cache"
 #define IPP_PORT_BASE   8631          /* premier port TCP local (+ i par imprimante) */
 #define MAX_PRINTERS    8             /* imprimantes simultanées max                 */
 #define MAX_CUPS_CONNS  32            /* connexions CUPS simultanées max             */
@@ -209,11 +208,8 @@ static void cups_register(const char *display_name, const char *cups_name,
 
 /* ── Traitement frame PRINTER_LIST ───────────────────────────────────────── */
 
-static void handle_printer_list(int virtio_fd, const uint8_t *payload,
-                                 uint32_t size)
+static void handle_printer_list(const uint8_t *payload, uint32_t size)
 {
-    (void)virtio_fd;
-
     if (size < 2) return;
 
     uint16_t count;
@@ -228,8 +224,6 @@ static void handle_printer_list(int virtio_fd, const uint8_t *payload,
         }
     }
     n_printers = 0;
-
-    FILE *cache = fopen(CACHE_FILE ".tmp", "w");
 
     const uint8_t *p   = payload + 2;
     const uint8_t *end = payload + size;
@@ -301,12 +295,7 @@ static void handle_printer_list(int virtio_fd, const uint8_t *payload,
         int is_default = (flags & DAAS_PRINTER_FLAG_DEFAULT) != 0;
         cups_register(display, printers[idx].cups_name, local_uri, is_default);
 
-        if (cache)
-            fprintf(cache, "%s\t%s\t%s\t%d\n",
-                    printers[idx].cups_name, display, remote_uri, is_default);
     }
-
-    if (cache) { fclose(cache); rename(CACHE_FILE ".tmp", CACHE_FILE); }
 }
 
 /* ── Boucle principale ───────────────────────────────────────────────────── */
@@ -428,7 +417,7 @@ static void read_loop(int virtio_fd)
             const uint8_t *payload = vbuf + off + FRAME_HDR;
 
             if (type == DAAS_PRINT_PRINTER_LIST) {
-                handle_printer_list(virtio_fd, payload, psize);
+                handle_printer_list(payload, psize);
             } else if (type == DAAS_TCP_DATA) {
                 for (int i = 0; i < MAX_CUPS_CONNS; i++) {
                     if (conns[i].fd >= 0 && conns[i].conn_id == conn_id) {

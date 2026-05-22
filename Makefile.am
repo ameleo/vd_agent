@@ -211,29 +211,6 @@ check_PROGRAMS += tests/test-device-info
 
 check_PROGRAMS += tests/test-termination
 
-# ── CUPS printer backend ──────────────────────────────────────────────────────
-# The binary must be installed as "spice" (matching the URI scheme "spice://"),
-# root-owned, mode 0700, in the CUPS backend directory.
-if HAVE_CUPS
-noinst_PROGRAMS = spice-cups-backend
-
-spice_cups_backend_SOURCES = \
-	src/printer/spice-cups-backend.c \
-	src/printer/print-protocol.h \
-	$(NULL)
-
-spice_cups_backend_CFLAGS = -I$(srcdir)/src/printer
-
-install-exec-hook:
-	$(MKDIR_P) $(DESTDIR)$(CUPS_BACKENDDIR)
-	$(INSTALL_PROGRAM) $(builddir)/spice-cups-backend \
-		$(DESTDIR)$(CUPS_BACKENDDIR)/spice
-	chmod 0700 $(DESTDIR)$(CUPS_BACKENDDIR)/spice
-
-uninstall-local:
-	rm -f $(DESTDIR)$(CUPS_BACKENDDIR)/spice
-endif
-
 EXTRA_DIST += \
 	src/printer/print-protocol.h \
 	$(NULL)

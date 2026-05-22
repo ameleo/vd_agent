@@ -130,26 +130,6 @@ PKG_CHECK_MODULES([GLIB], [glib-2.0 >= 2.68], [], [
     AC_DEFINE(g_memdup2, g_memdup, [GLib2 < 2.68 compatibility])
 ])
 
-dnl CUPS backend (optional)
-AC_ARG_WITH([cups-backenddir],
-  [AS_HELP_STRING([--with-cups-backenddir=DIR],
-    [install CUPS backend to DIR @<:@auto-detected via cups-config@:>@])],
-  [CUPS_BACKENDDIR="$withval"],
-  [CUPS_BACKENDDIR=""])
-
-have_cups=no
-if test -z "$CUPS_BACKENDDIR"; then
-  AC_PATH_PROG([CUPS_CONFIG], [cups-config], [no])
-  if test "$CUPS_CONFIG" != "no"; then
-    CUPS_BACKENDDIR=$("$CUPS_CONFIG" --serverbin)/backend
-    have_cups=yes
-  fi
-else
-  have_cups=yes
-fi
-AC_SUBST([CUPS_BACKENDDIR])
-AM_CONDITIONAL([HAVE_CUPS], [test x"$have_cups" = "xyes"])
-AM_CONDITIONAL([NO_CUPS],   [test x"$have_cups" = "xno"])
 
 if test "$with_session_info" = "auto" || test "$with_session_info" = "systemd"; then
     PKG_CHECK_MODULES([LIBSYSTEMD_LOGIN],
@@ -270,7 +250,6 @@ AC_MSG_NOTICE([
         udevdir:                  ${udevdir}
 
         use GTK+:                 ${with_gtk}
-        CUPS backend:             ${have_cups} (${CUPS_BACKENDDIR})
 
         Now type 'make' to build $PACKAGE
 

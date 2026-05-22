@@ -160,7 +160,8 @@ if INIT_SCRIPT_SYSTEMD
 systemdunitdir = $(SYSTEMDSYSTEMUNITDIR)
 systemdunit_DATA = \
 	$(top_srcdir)/data/spice-vdagentd.service \
-	$(top_srcdir)/data/spice-vdagentd.socket
+	$(top_srcdir)/data/spice-vdagentd.socket \
+	$(top_srcdir)/data/spice-printer.service
 
 userunitdir = $(SYSTEMDUSERUNITDIR)
 userunit_DATA = \
@@ -195,6 +196,7 @@ EXTRA_DIST =					\
 	data/spice-vdagent.service	   	\
 	data/spice-vdagentd			\
 	data/spice-vdagentd.service		\
+	data/spice-printer.service	\
 	data/spice-vdagentd.socket		\
 	data/tmpfiles.d/spice-vdagentd.conf	\
 	data/xorg.conf.RHEL-5			\

@@ -1,0 +1,11 @@
+[Unit]
+Description=DaaS IPP printer tunnel daemon
+After=network.target
+
+[Service]
+ExecStart=/usr/sbin/daas-printer-daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

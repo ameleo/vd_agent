@@ -16,7 +16,7 @@
  *      est réécrit).
  *
  * Compile:
- *   gcc -O2 -Wall -Wextra -o daas-printer-daemon daas-printer-daemon.c
+ *   gcc -O2 -Wall -Wextra -lpthread -o daas-printer-daemon daas-printer-daemon.c
  * Install:
  *   sudo install -m 0755 daas-printer-daemon /usr/local/sbin/
  */
@@ -29,6 +29,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <ctype.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/select.h>
@@ -149,25 +150,61 @@ static int create_listener(uint16_t port)
     return fd;
 }
 
-/* ── Enregistrement CUPS ─────────────────────────────────────────────────── */
+/* ── Enregistrement CUPS (thread dédié) ──────────────────────────────────── */
+/*
+ * lpadmin -m everywhere ouvre une connexion IPP vers le port local du démon.
+ * On ne peut pas l'appeler depuis la boucle select() principale : deadlock
+ * garanti (le démon est bloqué dans waitpid, ne peut pas accept()).
+ * Solution : thread détaché, la boucle select() continue à tourner.
+ */
 
-static void cups_register(const char *display_name, const char *cups_name,
-                           const char *ipp_uri, int is_default)
+typedef struct {
+    char display[512];
+    char cups_name[256];
+    char ipp_uri[512];
+    int  is_default;
+} CupsRegArgs;
+
+static void *cups_reg_thread(void *arg)
 {
+    CupsRegArgs *a = arg;
+
     char *add_args[] = {
-        "lpadmin", "-p", (char *)cups_name, "-v", (char *)ipp_uri, "-E",
+        "lpadmin", "-p", a->cups_name, "-v", a->ipp_uri, "-E",
         "-m", "everywhere",
-        "-D", (char *)display_name, NULL
+        "-D", a->display, NULL
     };
     run(add_args);
 
-    if (is_default) {
-        char *def_args[] = { "lpadmin", "-d", (char *)cups_name, NULL };
+    if (a->is_default) {
+        char *def_args[] = { "lpadmin", "-d", a->cups_name, NULL };
         run(def_args);
     }
 
     fprintf(stderr, "daas-printer: %s '%s' → %s → %s\n",
-            is_default ? "★" : " ", display_name, cups_name, ipp_uri);
+            a->is_default ? "★" : " ", a->display, a->cups_name, a->ipp_uri);
+    free(a);
+    return NULL;
+}
+
+static void cups_register(const char *display_name, const char *cups_name,
+                           const char *ipp_uri, int is_default)
+{
+    CupsRegArgs *a = malloc(sizeof(CupsRegArgs));
+    if (!a) return;
+    snprintf(a->display,   sizeof(a->display),   "%s", display_name);
+    snprintf(a->cups_name, sizeof(a->cups_name), "%s", cups_name);
+    snprintf(a->ipp_uri,   sizeof(a->ipp_uri),   "%s", ipp_uri);
+    a->is_default = is_default;
+
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, cups_reg_thread, a) != 0) {
+        free(a);
+        return;
+    }
+    pthread_detach(tid);
+    fprintf(stderr, "daas-printer: enregistrement async '%s' → %s\n",
+            cups_name, ipp_uri);
 }
 
 /* ── Traitement frame PRINTER_LIST ───────────────────────────────────────── */

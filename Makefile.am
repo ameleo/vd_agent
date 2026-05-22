@@ -211,9 +211,13 @@ check_PROGRAMS += tests/test-device-info
 
 check_PROGRAMS += tests/test-termination
 
-EXTRA_DIST += \
-	src/printer/print-protocol.h \
+sbin_PROGRAMS += daas-printer-daemon
+daas_printer_daemon_SOURCES = \
+	src/vdagent/printer.c \
+	src/vdagent/print-protocol.h \
 	$(NULL)
+daas_printer_daemon_CFLAGS  = -I$(srcdir)/src/vdagent
+daas_printer_daemon_LDFLAGS = -lpthread
 
 install-data-hook: install-systemd
 
